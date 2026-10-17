@@ -1,0 +1,21 @@
+[package]
+name = "ff"
+version = "0.1.0"
+edition = "2021"
+description = "Tiny interactive fuzzy finder for file names and file contents"
+license = "MIT"
+
+[[bin]]
+name = "ff"
+path = "src/main.rs"
+
+[dependencies]
+# Cross-platform raw mode, key events and cursor control.
+crossterm = { version = "0.29", default-features = false, features = ["events", "windows"] }
+# Regex search (Ctrl+R / -e). Default features: Unicode support and the fast matching engines.
+regex = "1.13"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
