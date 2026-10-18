@@ -1,15 +1,17 @@
-//! Turns `App` state into styled lines (pure, testable) and draws them.
+//! Draws `App` with ratatui. Rows are built cell by cell (pure, testable) so
+//! matched characters can be highlighted and long paths cut on the left, then
+//! rendered into the areas ratatui lays out.
 //!
 //! Layout, top to bottom: result list, status bar, prompt, key help. On wide
 //! terminals the list area is split: results left, preview of the selected
 //! file right.
 
-use std::io::{self, Write};
-
-use crossterm::cursor::{Hide, MoveTo, Show};
-use crossterm::style::{Attribute, Color, Print, SetAttribute, SetBackgroundColor, SetForegroundColor};
-use crossterm::terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate};
-use crossterm::queue;
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Padding, Paragraph};
+use ratatui::Frame;
+use unicode_width::UnicodeWidthChar;
 
 use crate::app::{App, Hit, Mode};
 use crate::content::ContentMatch;
@@ -20,137 +22,141 @@ use crate::tree::{Kind, TreeRow};
 const PROMPT: &str = "> ";
 const HELP: &str = "Tab mode  ^R regex  ^L tree  ^T preview  ^S mark  ^O open  ^Y copy  Enter select  Esc quit";
 /// Rows used by prompt, status bar and help line.
-const CHROME_ROWS: usize = 3;
-/// Below this usable width the preview pane is hidden.
-const MIN_SPLIT_WIDTH: usize = 60;
-const SEPARATOR: char = '│';
+const CHROME_ROWS: u16 = 3;
+/// Below this width the preview pane is hidden.
+const MIN_SPLIT_WIDTH: u16 = 61;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Style {
-    Normal,
-    Prompt,
-    Info,
-    Dim,
-    Path,
-    Match,
-    Selected,
-    SelectedMatch,
-    Tab,
-    ActiveTab,
-    Badge,
-    Error,
-    Dir,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Span {
-    pub text: String,
-    pub style: Style,
-}
-
-pub type Line = Vec<Span>;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Frame {
-    pub lines: Vec<Line>,
-    /// Terminal cursor position (column, row) inside the prompt.
-    pub cursor: (u16, u16),
-}
+const NORMAL: Style = Style::new();
+const PROMPT_STYLE: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+const INFO: Style = Style::new().fg(Color::Yellow);
+const DIM: Style = Style::new().fg(Color::DarkGray);
+const PATH: Style = Style::new().fg(Color::Magenta);
+const MATCH: Style = Style::new().fg(Color::Green).add_modifier(Modifier::BOLD);
+const SELECTED: Style = Style::new().fg(Color::White).bg(Color::DarkGray);
+const SELECTED_MATCH: Style = Style::new().fg(Color::Green).bg(Color::DarkGray).add_modifier(Modifier::BOLD);
+const ACTIVE_TAB: Style = Style::new().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD);
+const BADGE: Style = Style::new().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD);
+const ERROR: Style = Style::new().fg(Color::Red);
+const DIR: Style = Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD);
 
 type Cell = (char, Style);
 
-/// Never write into the last column: some terminals wrap or scroll there.
-fn usable_width(width: u16) -> usize {
-    (width as usize).saturating_sub(1).max(1)
+/// Where each part of the screen goes.
+struct Areas {
+    list: Rect,
+    /// The preview pane, its separator included, when shown.
+    preview: Option<Rect>,
+    status: Option<Rect>,
+    prompt: Option<Rect>,
+    help: Option<Rect>,
+}
+
+/// When the terminal is too short for all three bottom rows, the status bar
+/// goes first, then the help; the prompt stays.
+fn areas(app: &App, area: Rect) -> Areas {
+    let chrome = area.height.min(CHROME_ROWS);
+    let [list, bottom] = Layout::vertical([Constraint::Fill(1), Constraint::Length(chrome)]).areas(area);
+    let row = |i: u16| Rect { y: bottom.y + i, height: 1, ..bottom };
+    let (status, prompt, help) = match chrome {
+        3 => (Some(row(0)), Some(row(1)), Some(row(2))),
+        2 => (None, Some(row(0)), Some(row(1))),
+        1 => (None, Some(row(0)), None),
+        _ => (None, None, None),
+    };
+    let (list, preview) = if app.show_preview() && list.width >= MIN_SPLIT_WIDTH {
+        let [list, preview] =
+            Layout::horizontal([Constraint::Length(list.width / 2), Constraint::Fill(1)]).areas(list);
+        (list, Some(preview))
+    } else {
+        (list, None)
+    };
+    Areas { list, preview, status, prompt, help }
+}
+
+/// The preview pane's border on its left, a column of space, then the file.
+fn preview_block() -> Block<'static> {
+    Block::new().borders(Borders::LEFT).border_style(DIM).padding(Padding::left(1))
 }
 
 /// Rows available for the result list on a terminal `height` rows tall.
 pub fn list_height(height: u16) -> usize {
-    (height as usize).saturating_sub(CHROME_ROWS)
+    height.saturating_sub(CHROME_ROWS) as usize
 }
 
 /// Which part of the screen a mouse event at (`col`, `row`) is over.
 pub fn hit_test(app: &App, width: u16, height: u16, col: u16, row: u16) -> Hit {
-    let (col, row) = (col as usize, row as usize);
-    if row >= list_height(height) {
+    let areas = areas(app, Rect::new(0, 0, width, height));
+    if row >= areas.list.bottom() {
         return Hit::Other;
     }
-    match split_widths(app, usable_width(width)) {
-        Some((list, _)) if col > list => Hit::Preview,
-        Some((list, _)) if col == list => Hit::Other,
-        _ => Hit::List(row),
+    match areas.preview {
+        Some(preview) if col > preview.x => Hit::Preview,
+        Some(preview) if col == preview.x => Hit::Other,
+        _ => Hit::List(row as usize),
     }
-}
-
-/// `(list width, preview width)` when the preview pane is shown.
-fn split_widths(app: &App, width: usize) -> Option<(usize, usize)> {
-    if !app.show_preview() || width < MIN_SPLIT_WIDTH {
-        return None;
-    }
-    let list = width / 2;
-    Some((list, width - list - 1))
 }
 
 /// How many file lines the preview pane can show (below its header), or
 /// `None` when the pane is hidden.
 pub fn preview_rows(app: &App, width: u16, height: u16) -> Option<usize> {
-    split_widths(app, usable_width(width))?;
-    let rows = list_height(height).saturating_sub(1);
+    let preview = areas(app, Rect::new(0, 0, width, height)).preview?;
+    let rows = preview_block().inner(preview).height.saturating_sub(1) as usize;
     (rows > 0).then_some(rows)
 }
 
-/// Builds the screen for a terminal of `width` x `height`. Also updates the
-/// app's scroll position to fit the list height.
-pub fn layout(app: &mut App, preview: Option<&Preview>, width: u16, height: u16) -> Frame {
-    let width = usable_width(width);
-    let list_height = list_height(height);
-    let height = height as usize;
-    app.adjust_scroll(list_height);
+/// Draws the whole screen. Also updates the app's scroll position to fit the
+/// list height.
+pub fn render(app: &mut App, preview: Option<&Preview>, frame: &mut Frame) {
+    let areas = areas(app, frame.area());
+    app.adjust_scroll(areas.list.height as usize);
+    let app = &*app;
 
-    let mut lines = Vec::with_capacity(height);
-    let split = split_widths(app, width);
-    let list_width = split.map_or(width, |(list, _)| list);
+    let width = areas.list.width as usize;
     let start = app.offset();
-    for row in 0..list_height {
-        let i = start + row;
-        let selected = i == app.selected();
-        let mut cells = if app.tree_view() {
-            app.tree().rows.get(i).map(|r| tree_row(app, r, list_width))
-        } else {
-            match app.mode() {
-                Mode::Files => app.file_matches().get(i).map(|m| {
-                    file_row(&app.files()[m.idx], &m.positions, selected, app.is_marked(i), list_width)
-                }),
-                Mode::Content => {
-                    app.content_matches().get(i).map(|m| content_row(m, selected, app.is_marked(i), list_width))
+    let rows: Vec<Line> = (0..areas.list.height as usize)
+        .map(|row| {
+            let i = start + row;
+            let selected = i == app.selected();
+            let cells = if app.tree_view() {
+                app.tree().rows.get(i).map(|r| tree_row(app, r, width))
+            } else {
+                match app.mode() {
+                    Mode::Files => app.file_matches().get(i).map(|m| {
+                        file_row(&app.files()[m.idx], &m.positions, selected, app.is_marked(i), width)
+                    }),
+                    Mode::Content => {
+                        app.content_matches().get(i).map(|m| content_row(m, selected, app.is_marked(i), width))
+                    }
                 }
-            }
-        }
-        .unwrap_or_default();
-        if let Some((list_width, preview_width)) = split {
-            pad(&mut cells, list_width, Style::Normal);
-            cells.push((SEPARATOR, Style::Dim));
-            cells.extend(preview_row(preview, row, preview_width, app.matcher()));
-        }
-        lines.push(to_spans(&cells));
-    }
+            };
+            to_spans(&cells.unwrap_or_default())
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(rows), areas.list);
 
-    // Bottom rows: status, prompt, key help. When the terminal is too short
-    // for all three, the status bar goes first, then the help; the prompt stays.
-    let (prompt, cursor_col) = prompt_line(app, width);
-    let help = to_spans(&fit_right(text_cells(HELP, Style::Dim), width));
-    let mut chrome = vec![status_line(app, width), prompt, help];
-    let keep = height.min(CHROME_ROWS);
-    if keep < CHROME_ROWS {
-        chrome.remove(0);
+    if let Some(area) = areas.preview {
+        let block = preview_block();
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let lines: Vec<Line> = (0..inner.height as usize)
+            .map(|row| to_spans(&preview_row(preview, row, inner.width as usize, app.matcher())))
+            .collect();
+        frame.render_widget(Paragraph::new(lines), inner);
     }
-    chrome.truncate(keep);
-    let prompt_row = lines.len() + usize::from(keep == CHROME_ROWS);
-    lines.extend(chrome);
-    Frame { lines, cursor: (cursor_col as u16, prompt_row as u16) }
+    if let Some(area) = areas.status {
+        frame.render_widget(status_line(app, area.width as usize), area);
+    }
+    if let Some(area) = areas.prompt {
+        let (line, cursor) = prompt_line(app, area.width as usize);
+        frame.render_widget(line, area);
+        frame.set_cursor_position((area.x + cursor as u16, area.y));
+    }
+    if let Some(area) = areas.help {
+        frame.render_widget(to_spans(&fit_right(text_cells(HELP, DIM), area.width as usize)), area);
+    }
 }
 
-fn prompt_line(app: &App, width: usize) -> (Line, usize) {
+fn prompt_line(app: &App, width: usize) -> (Line<'static>, usize) {
     let query: Vec<char> = app.query().chars().collect();
     let prompt_len = PROMPT.chars().count();
     let avail = width.saturating_sub(prompt_len).max(1);
@@ -158,14 +164,14 @@ fn prompt_line(app: &App, width: usize) -> (Line, usize) {
     let start = (app.cursor() + 1).saturating_sub(avail);
     let visible: String = query.iter().skip(start).take(avail).collect();
     let before_cursor: String = query[start..app.cursor()].iter().collect();
-    let line = vec![span(PROMPT, Style::Prompt), span(&visible, Style::Normal)];
+    let line = Line::from(vec![Span::styled(PROMPT, PROMPT_STYLE), Span::styled(visible, NORMAL)]);
     (line, prompt_len + str_width(&before_cursor))
 }
 
-fn status_line(app: &App, width: usize) -> Line {
+fn status_line(app: &App, width: usize) -> Line<'static> {
     let (files_style, content_style) = match app.mode() {
-        Mode::Files => (Style::ActiveTab, Style::Tab),
-        Mode::Content => (Style::Tab, Style::ActiveTab),
+        Mode::Files => (ACTIVE_TAB, DIM),
+        Mode::Content => (DIM, ACTIVE_TAB),
     };
     let total = app.files().len();
     let scanning = if app.is_walking() { " (scanning...)" } else { "" };
@@ -186,16 +192,16 @@ fn status_line(app: &App, width: usize) -> Line {
     let mut cells = text_cells(" Files ", files_style);
     cells.extend(text_cells(" Content ", content_style));
     if app.regex() {
-        cells.push((' ', Style::Normal));
-        cells.extend(text_cells(" regex ", Style::Badge));
+        cells.push((' ', NORMAL));
+        cells.extend(text_cells(" regex ", BADGE));
     }
     if app.marked_count() > 0 {
-        cells.extend(text_cells(&format!("  {} marked", app.marked_count()), Style::Badge));
+        cells.extend(text_cells(&format!("  {} marked", app.marked_count()), BADGE));
     }
     match (app.query_error(), app.flash()) {
-        (Some(e), _) => cells.extend(text_cells(&format!("  invalid regex: {e}"), Style::Error)),
-        (None, Some(flash)) => cells.extend(text_cells(&format!("  {flash}"), Style::Info)),
-        (None, None) => cells.extend(text_cells(&info, Style::Info)),
+        (Some(e), _) => cells.extend(text_cells(&format!("  invalid regex: {e}"), ERROR)),
+        (None, Some(flash)) => cells.extend(text_cells(&format!("  {flash}"), INFO)),
+        (None, None) => cells.extend(text_cells(&info, INFO)),
     }
     to_spans(&fit_right(cells, width))
 }
@@ -205,9 +211,7 @@ fn status_line(app: &App, width: usize) -> Line {
 /// occurrence of the query is marked.
 fn preview_row(preview: Option<&Preview>, row: usize, width: usize, matcher: Option<&Matcher>) -> Vec<Cell> {
     let Some(p) = preview else { return Vec::new() };
-    let mut cells = vec![(' ', Style::Normal)];
-    let width = width.saturating_sub(1);
-    let note = |text: &str| fit_right(text_cells(text, Style::Dim), width);
+    let note = |text: &str| fit_right(text_cells(text, DIM), width);
 
     if row == 0 {
         let mut header = match p.focus {
@@ -219,36 +223,34 @@ fn preview_row(preview: Option<&Preview>, row: usize, width: usize, matcher: Opt
                 header.push_str(&format!("  [{}-{}]", first_line, first_line + lines.len() - 1));
             }
         }
-        cells.extend(fit_left(text_cells(&header, Style::Path), width));
-        return cells;
+        return fit_left(text_cells(&header, PATH), width);
     }
     let r = row - 1;
     match &p.body {
-        Body::Binary if r == 0 => cells.extend(note("(binary file)")),
-        Body::Unreadable(e) if r == 0 => cells.extend(note(&format!("(cannot read: {e})"))),
-        Body::Text { first_line: 1, lines } if lines.is_empty() && r == 0 => cells.extend(note("(empty file)")),
+        Body::Binary if r == 0 => note("(binary file)"),
+        Body::Unreadable(e) if r == 0 => note(&format!("(cannot read: {e})")),
+        Body::Text { first_line: 1, lines } if lines.is_empty() && r == 0 => note("(empty file)"),
         Body::Text { first_line, lines } => {
-            let Some(line) = lines.get(r) else { return cells };
+            let Some(line) = lines.get(r) else { return Vec::new() };
             let number = first_line + r;
             let gutter = (first_line + lines.len() - 1).to_string().len();
             let focused = p.focus == Some(number);
             let (base, hl) = row_styles(focused);
             let ranges = matcher.map(|m| m.find_all(line)).unwrap_or_default();
 
-            let mut line_cells = text_cells(&format!("{number:>gutter$} "), if focused { base } else { Style::Dim });
-            line_cells.extend(line.chars().enumerate().map(|(i, c)| {
+            let mut cells = text_cells(&format!("{number:>gutter$} "), if focused { base } else { DIM });
+            cells.extend(line.chars().enumerate().map(|(i, c)| {
                 let hit = ranges.iter().any(|&(s, e)| (s..e).contains(&i));
                 (c, if hit { hl } else { base })
             }));
-            let mut fitted = fit_right(line_cells, width);
+            let mut fitted = fit_right(cells, width);
             if focused {
-                pad(&mut fitted, width, Style::Selected);
+                pad(&mut fitted, width, SELECTED);
             }
-            cells.extend(fitted);
+            fitted
         }
-        _ => {}
+        _ => Vec::new(),
     }
-    cells
 }
 
 fn file_row(path: &str, positions: &[usize], selected: bool, marked: bool, width: usize) -> Vec<Cell> {
@@ -277,9 +279,9 @@ fn content_row(m: &ContentMatch, selected: bool, marked: bool, width: usize) -> 
     let avail = width.saturating_sub(cells.len());
 
     let prefix = format!("{}:{}: ", m.path, m.line);
-    let prefix_style = if selected { Style::Selected } else { Style::Path };
+    let prefix_style = if selected { SELECTED } else { PATH };
     let prefix = fit_left(text_cells(&prefix, prefix_style), (avail / 2).max(1));
-    let text_avail = avail.saturating_sub(prefix.len());
+    let text_avail = avail.saturating_sub(cells_width(&prefix));
     cells.extend(prefix);
     cells.extend(match_text(m, base, hl, text_avail));
     finish_row(cells, selected, width)
@@ -311,9 +313,9 @@ fn tree_row(app: &App, row: &TreeRow, width: usize) -> Vec<Cell> {
     let marked = row.result.is_some_and(|i| app.is_marked(i));
     let (base, hl) = row_styles(selected);
     let mut cells = marker(selected, marked);
-    cells.extend(text_cells(&row.guide, if selected { base } else { Style::Dim }));
+    cells.extend(text_cells(&row.guide, if selected { base } else { DIM }));
     match (row.kind, row.result) {
-        (Kind::Dir, _) => cells.extend(text_cells(&row.label, Style::Dir)),
+        (Kind::Dir, _) => cells.extend(text_cells(&row.label, DIR)),
         (Kind::File, Some(i)) => {
             let positions = &app.file_matches()[i].positions;
             cells.extend(row.label.chars().enumerate().map(|(j, c)| {
@@ -321,10 +323,10 @@ fn tree_row(app: &App, row: &TreeRow, width: usize) -> Vec<Cell> {
                 (c, if hit { hl } else { base })
             }));
         }
-        (Kind::File, None) => cells.extend(text_cells(&row.label, Style::Path)),
+        (Kind::File, None) => cells.extend(text_cells(&row.label, PATH)),
         (Kind::Line, Some(i)) => {
             let m = &app.content_matches()[i];
-            cells.extend(text_cells(&format!("{}: ", m.line), if selected { base } else { Style::Dim }));
+            cells.extend(text_cells(&format!("{}: ", m.line), if selected { base } else { DIM }));
             let avail = width.saturating_sub(cells_width(&cells));
             cells.extend(match_text(m, base, hl, avail));
         }
@@ -335,57 +337,38 @@ fn tree_row(app: &App, row: &TreeRow, width: usize) -> Vec<Cell> {
 
 fn row_styles(selected: bool) -> (Style, Style) {
     if selected {
-        (Style::Selected, Style::SelectedMatch)
+        (SELECTED, SELECTED_MATCH)
     } else {
-        (Style::Normal, Style::Match)
+        (NORMAL, MATCH)
     }
 }
 
 /// Two columns: `>` for the selected row, `•` for marked rows.
 fn marker(selected: bool, marked: bool) -> Vec<Cell> {
-    let style = if selected { Style::Selected } else { Style::Normal };
-    let mark = if marked { ('\u{2022}', if selected { Style::Selected } else { Style::Badge }) } else { (' ', style) };
+    let style = if selected { SELECTED } else { NORMAL };
+    let mark = if marked { ('\u{2022}', if selected { SELECTED } else { BADGE }) } else { (' ', style) };
     vec![(if selected { '>' } else { ' ' }, style), mark]
 }
 
 /// Pads the selected row so its background spans the full width.
 fn finish_row(mut cells: Vec<Cell>, selected: bool, width: usize) -> Vec<Cell> {
     if selected {
-        pad(&mut cells, width, Style::Selected);
+        pad(&mut cells, width, SELECTED);
     }
     cells
 }
 
-/// Terminal columns taken by `c`: 0 for combining marks and zero-width
-/// characters, 2 for East Asian wide characters and most emoji.
-pub fn char_width(c: char) -> usize {
-    let cp = c as u32;
-    let zero = matches!(cp,
-        0x0300..=0x036F | 0x0483..=0x0489 | 0x0591..=0x05BD | 0x0610..=0x061A | 0x064B..=0x065F
-        | 0x0E31 | 0x0E34..=0x0E3A | 0x0E47..=0x0E4E | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF
-        | 0x200B..=0x200F | 0x20D0..=0x20FF | 0xFE00..=0xFE0F | 0xFE20..=0xFE2F | 0xE0100..=0xE01EF);
-    if zero {
-        return 0;
-    }
-    let wide = matches!(cp,
-        0x1100..=0x115F | 0x231A..=0x231B | 0x2329..=0x232A | 0x23E9..=0x23EC | 0x23F0 | 0x23F3
-        | 0x25FD..=0x25FE | 0x2614..=0x2615 | 0x2648..=0x2653 | 0x267F | 0x2693 | 0x26A1
-        | 0x26AA..=0x26AB | 0x26BD..=0x26BE | 0x26C4..=0x26C5 | 0x26CE | 0x26D4 | 0x26EA
-        | 0x26F2..=0x26F3 | 0x26F5 | 0x26FA | 0x26FD | 0x2705 | 0x270A..=0x270B | 0x2728 | 0x274C
-        | 0x274E | 0x2753..=0x2755 | 0x2757 | 0x2795..=0x2797 | 0x27B0 | 0x27BF | 0x2B1B..=0x2B1C
-        | 0x2B50 | 0x2B55 | 0x2E80..=0x303E | 0x3041..=0x33FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF
-        | 0xA000..=0xA4CF | 0xA960..=0xA97F | 0xAC00..=0xD7A3 | 0xF900..=0xFAFF | 0xFE10..=0xFE19
-        | 0xFE30..=0xFE6F | 0xFF00..=0xFF60 | 0xFFE0..=0xFFE6 | 0x1F004 | 0x1F0CF | 0x1F18E
-        | 0x1F191..=0x1F19A | 0x1F200..=0x1F251 | 0x1F300..=0x1F64F | 0x1F680..=0x1F6FF
-        | 0x1F7E0..=0x1F7EB | 0x1F90C..=0x1F9FF | 0x1FA70..=0x1FAFF | 0x20000..=0x3FFFD);
-    if wide {
-        2
+/// Terminal columns taken by `c`, as ratatui counts them: 0 for control and
+/// combining characters, 2 for East Asian wide characters and most emoji.
+fn char_width(c: char) -> usize {
+    if c.is_control() {
+        0
     } else {
-        1
+        c.width().unwrap_or(0)
     }
 }
 
-pub fn str_width(s: &str) -> usize {
+fn str_width(s: &str) -> usize {
     s.chars().map(char_width).sum()
 }
 
@@ -399,15 +382,11 @@ fn pad(cells: &mut Vec<Cell>, width: usize, style: Style) {
     cells.extend(std::iter::repeat_n((' ', style), width.saturating_sub(have)));
 }
 
-fn span(text: &str, style: Style) -> Span {
-    Span { text: text.to_string(), style }
-}
-
 fn text_cells(text: &str, style: Style) -> Vec<Cell> {
     text.chars().map(|c| (c, style)).collect()
 }
 
-/// Keeps the first `width` cells, marking a cut with `…`.
+/// Keeps the first `width` columns, marking a cut with `…`.
 fn fit_right(cells: Vec<Cell>, width: usize) -> Vec<Cell> {
     if cells_width(&cells) <= width {
         return cells;
@@ -451,79 +430,83 @@ fn fit_left(cells: Vec<Cell>, width: usize) -> Vec<Cell> {
 }
 
 /// Merges runs of equally styled cells into spans.
-fn to_spans(cells: &[Cell]) -> Line {
-    let mut spans: Line = Vec::new();
+fn to_spans(cells: &[Cell]) -> Line<'static> {
+    let mut spans: Vec<Span> = Vec::new();
     for &(c, style) in cells {
         match spans.last_mut() {
-            Some(last) if last.style == style => last.text.push(c),
-            _ => spans.push(Span { text: c.to_string(), style }),
+            Some(last) if last.style == style => last.content.to_mut().push(c),
+            _ => spans.push(Span::styled(c.to_string(), style)),
         }
     }
-    spans
-}
-
-fn apply_style(out: &mut impl Write, style: Style) -> io::Result<()> {
-    queue!(out, SetAttribute(Attribute::Reset))?;
-    match style {
-        Style::Normal => {}
-        Style::Prompt => queue!(out, SetForegroundColor(Color::Cyan), SetAttribute(Attribute::Bold))?,
-        Style::Info => queue!(out, SetForegroundColor(Color::Yellow))?,
-        Style::Dim | Style::Tab => queue!(out, SetForegroundColor(Color::DarkGrey))?,
-        Style::Dir => queue!(out, SetForegroundColor(Color::Blue), SetAttribute(Attribute::Bold))?,
-        Style::Error => queue!(out, SetForegroundColor(Color::Red))?,
-        Style::Badge => queue!(
-            out,
-            SetBackgroundColor(Color::Yellow),
-            SetForegroundColor(Color::Black),
-            SetAttribute(Attribute::Bold)
-        )?,
-        Style::Path => queue!(out, SetForegroundColor(Color::Magenta))?,
-        Style::Match => queue!(out, SetForegroundColor(Color::Green), SetAttribute(Attribute::Bold))?,
-        Style::Selected => queue!(out, SetBackgroundColor(Color::DarkGrey), SetForegroundColor(Color::White))?,
-        Style::SelectedMatch => queue!(
-            out,
-            SetBackgroundColor(Color::DarkGrey),
-            SetForegroundColor(Color::Green),
-            SetAttribute(Attribute::Bold)
-        )?,
-        Style::ActiveTab => queue!(
-            out,
-            SetBackgroundColor(Color::Cyan),
-            SetForegroundColor(Color::Black),
-            SetAttribute(Attribute::Bold)
-        )?,
-    }
-    Ok(())
-}
-
-/// Writes a full frame, redrawing every row.
-pub fn draw(out: &mut impl Write, frame: &Frame) -> io::Result<()> {
-    queue!(out, BeginSynchronizedUpdate, Hide)?;
-    for (y, line) in frame.lines.iter().enumerate() {
-        queue!(out, MoveTo(0, y as u16))?;
-        for s in line {
-            apply_style(out, s.style)?;
-            queue!(out, Print(&s.text))?;
-        }
-        queue!(out, SetAttribute(Attribute::Reset), Clear(ClearType::UntilNewLine))?;
-    }
-    queue!(out, MoveTo(frame.cursor.0, frame.cursor.1), Show, EndSynchronizedUpdate)?;
-    out.flush()
+    Line::from(spans)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::content::ContentBatch;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::backend::{Backend, TestBackend};
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::Terminal;
     use std::sync::Arc;
+    use unicode_width::UnicodeWidthStr;
 
-    fn text(line: &Line) -> String {
-        line.iter().map(|s| s.text.as_str()).collect()
+    const SEPARATOR: char = '│';
+
+    /// A drawn screen: its rows as text and as styled cells, and the cursor.
+    struct Screen {
+        rows: Vec<Vec<(String, Style)>>,
+        cursor: (u16, u16),
     }
 
-    fn styled(line: &Line, style: Style) -> String {
-        line.iter().filter(|s| s.style == style).map(|s| s.text.as_str()).collect()
+    impl Screen {
+        fn text(&self, y: usize) -> String {
+            self.rows[y].iter().map(|(s, _)| s.as_str()).collect()
+        }
+
+        fn trimmed(&self, y: usize) -> String {
+            self.text(y).trim_end().to_string()
+        }
+
+        /// The characters of row `y` drawn in `style`.
+        fn styled(&self, y: usize, style: Style) -> String {
+            self.rows[y].iter().filter(|(_, s)| *s == style).map(|(s, _)| s.as_str()).collect()
+        }
+
+        /// The part of row `y` right of the separator.
+        fn pane(&self, y: usize) -> String {
+            self.text(y).split_once(SEPARATOR).map(|(_, p)| p.trim_end().to_string()).unwrap_or_default()
+        }
+    }
+
+    fn draw(app: &mut App, preview: Option<&Preview>, width: u16, height: u16) -> Screen {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| render(app, preview, frame)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rows = (0..height)
+            .map(|y| {
+                let mut row = Vec::new();
+                let mut x = 0;
+                // A wide character covers the cell after it: skip that one.
+                while x < width {
+                    let cell = &buffer[(x, y)];
+                    let style = Style::new().fg(cell.fg).bg(cell.bg).add_modifier(cell.modifier);
+                    row.push((cell.symbol().to_string(), style));
+                    x += cell.symbol().width().max(1) as u16;
+                }
+                row
+            })
+            .collect();
+        let cursor = terminal.backend_mut().get_cursor_position().unwrap();
+        Screen { rows, cursor: (cursor.x, cursor.y) }
+    }
+
+    /// `style` as the buffer reports it: unset colors read back as `Reset`.
+    fn drawn(style: Style) -> Style {
+        Style::new()
+            .fg(style.fg.unwrap_or(Color::Reset))
+            .bg(style.bg.unwrap_or(Color::Reset))
+            .add_modifier(style.add_modifier)
     }
 
     fn app(names: &[&str], query: &str) -> App {
@@ -539,88 +522,81 @@ mod tests {
     #[test]
     fn frame_fills_terminal_height() {
         let mut a = app(&["a", "b"], "");
-        let f = layout(&mut a, None, 40, 10);
-        assert_eq!(f.lines.len(), 10);
-        assert_eq!(text(&f.lines[8]), "> ");
-        assert!(text(&f.lines[7]).contains("2/2 files"));
-        assert!(text(&f.lines[9]).starts_with("Tab mode"));
+        let s = draw(&mut a, None, 40, 10);
+        assert_eq!(s.trimmed(8), ">");
+        assert!(s.text(7).contains("2/2 files"));
+        assert!(s.text(9).starts_with("Tab mode"));
     }
 
     #[test]
-    fn lines_never_exceed_width() {
+    fn long_paths_fit_every_width() {
         let long = "x/".repeat(100) + "file.txt";
         let mut a = app(&[&long, "short"], "file");
         a.finish_walk();
-        for w in [5u16, 20, 80] {
-            let f = layout(&mut a, None, w, 8);
-            for line in &f.lines {
-                assert!(text(line).chars().count() < w as usize, "w={w}: {:?}", text(line));
-            }
+        for w in [12u16, 20, 60] {
+            let s = draw(&mut a, None, w, 8);
+            assert!(s.trimmed(0).ends_with("file.txt"), "w={w}: {:?}", s.text(0));
+            assert!(s.text(0).contains('…'));
         }
     }
 
     #[test]
     fn prompt_sits_above_help_at_the_bottom() {
         let mut a = app(&["a.txt", "b.txt"], "txt");
-        let f = layout(&mut a, None, 40, 6);
-        let rows: Vec<String> = f.lines.iter().map(|l| text(l).trim_end().to_string()).collect();
-        assert!(rows[0].starts_with("> ") && rows[0].contains(".txt"), "results first: {rows:?}");
-        assert!(rows[3].contains("files"), "status above prompt: {rows:?}");
-        assert_eq!(rows[4], "> txt");
-        assert!(rows[5].starts_with("Tab mode"));
-        assert_eq!(f.cursor, (5, 4));
+        let s = draw(&mut a, None, 40, 6);
+        assert!(s.text(0).starts_with("> ") && s.text(0).contains(".txt"), "results first");
+        assert!(s.text(3).contains("files"), "status above prompt");
+        assert_eq!(s.trimmed(4), "> txt");
+        assert!(s.text(5).starts_with("Tab mode"));
+        assert_eq!(s.cursor, (5, 4));
     }
 
     #[test]
     fn short_terminal_keeps_prompt() {
         let mut a = app(&["a"], "q");
-        let rows = |f: &Frame| f.lines.iter().map(text).collect::<Vec<_>>();
-        let f = layout(&mut a, None, 40, 2);
-        assert_eq!(rows(&f)[0], "> q");
-        assert!(rows(&f)[1].starts_with("Tab mode"));
-        assert_eq!(f.cursor, (3, 0));
-        let f = layout(&mut a, None, 40, 1);
-        assert_eq!(rows(&f), vec!["> q"]);
-        assert_eq!(f.cursor, (3, 0));
-        assert!(layout(&mut a, None, 40, 0).lines.is_empty());
+        let s = draw(&mut a, None, 40, 2);
+        assert_eq!(s.trimmed(0), "> q");
+        assert!(s.text(1).starts_with("Tab mode"));
+        assert_eq!(s.cursor, (3, 0));
+        let s = draw(&mut a, None, 40, 1);
+        assert_eq!(s.trimmed(0), "> q");
+        assert_eq!(s.cursor, (3, 0));
+        draw(&mut a, None, 40, 0);
     }
 
     #[test]
     fn tiny_terminal_does_not_panic() {
         let mut a = app(&["a"], "a");
         for (w, h) in [(0, 0), (1, 1), (3, 2), (2, 3)] {
-            let f = layout(&mut a, None, w, h);
-            assert!(f.lines.len() <= h as usize);
+            draw(&mut a, None, w, h);
         }
     }
 
     #[test]
     fn highlights_matched_characters() {
         let mut a = app(&["foo/bar.rs"], "fbr");
-        let f = layout(&mut a, None, 40, 6);
-        let row = &f.lines[0];
-        assert_eq!(text(row).trim_end(), "> foo/bar.rs");
-        assert_eq!(styled(row, Style::SelectedMatch), "fbr");
+        let s = draw(&mut a, None, 40, 6);
+        assert_eq!(s.trimmed(0), "> foo/bar.rs");
+        assert_eq!(s.styled(0, drawn(SELECTED_MATCH)), "fbr");
     }
 
     #[test]
     fn selected_row_is_marked_and_padded() {
         let mut a = app(&["a.txt", "b.txt"], "");
         press(&mut a, KeyCode::Down);
-        let f = layout(&mut a, None, 30, 6);
-        assert_eq!(text(&f.lines[0]), "  a.txt");
-        assert!(text(&f.lines[1]).starts_with("> b.txt"));
-        assert_eq!(text(&f.lines[1]).chars().count(), 29);
+        let s = draw(&mut a, None, 30, 6);
+        assert_eq!(s.trimmed(0), "  a.txt");
+        assert!(s.text(1).starts_with("> b.txt"));
+        assert_eq!(s.rows[1].last().unwrap().1, drawn(SELECTED), "the background spans the row");
     }
 
     #[test]
     fn long_paths_keep_file_name_visible() {
         let long = "very/long/directory/structure/that/goes/on/target_file.rs";
         let mut a = app(&[long], "");
-        let f = layout(&mut a, None, 25, 5);
-        let row = text(&f.lines[0]);
-        assert!(row.trim_end().ends_with("target_file.rs"), "{row}");
-        assert!(row.contains('…'));
+        let s = draw(&mut a, None, 25, 5);
+        assert!(s.trimmed(0).ends_with("target_file.rs"), "{}", s.text(0));
+        assert!(s.text(0).contains('…'));
     }
 
     #[test]
@@ -631,8 +607,8 @@ mod tests {
         for _ in 0..12 {
             press(&mut a, KeyCode::Down);
         }
-        let f = layout(&mut a, None, 20, 8); // 5 list rows
-        let rows: Vec<String> = f.lines[0..5].iter().map(|l| text(l).trim_end().to_string()).collect();
+        let s = draw(&mut a, None, 20, 8); // 5 list rows
+        let rows: Vec<String> = (0..5).map(|y| s.trimmed(y)).collect();
         assert_eq!(rows, vec!["  f08", "  f09", "  f10", "  f11", "> f12"]);
     }
 
@@ -640,44 +616,43 @@ mod tests {
     fn prompt_cursor_position() {
         let mut a = app(&[], "héllo");
         press(&mut a, KeyCode::Left);
-        let f = layout(&mut a, None, 40, 5);
-        assert_eq!(text(&f.lines[3]), "> héllo");
-        assert_eq!(f.cursor, (6, 3));
+        let s = draw(&mut a, None, 40, 5);
+        assert_eq!(s.trimmed(3), "> héllo");
+        assert_eq!(s.cursor, (6, 3));
     }
 
     #[test]
     fn long_query_scrolls_to_cursor() {
         let q = "abcdefghijklmnopqrstuvwxyz";
         let mut a = app(&[], q);
-        let f = layout(&mut a, None, 11, 5); // usable width 10, query area 8
-        assert_eq!(text(&f.lines[3]), "> tuvwxyz");
-        assert_eq!(f.cursor, (9, 3));
-        assert!((f.cursor.0 as usize) < 10);
+        let s = draw(&mut a, None, 11, 5); // query area 9
+        assert_eq!(s.trimmed(3), "> stuvwxyz");
+        assert_eq!(s.cursor, (10, 3));
     }
 
     #[test]
     fn status_shows_mode_and_counts() {
         let mut a = app(&["a.rs", "b.md"], "rs");
-        let f = layout(&mut a, None, 80, 5);
-        assert_eq!(styled(&f.lines[2], Style::ActiveTab), " Files ");
-        assert!(text(&f.lines[2]).contains("1/2 files (scanning...)"));
+        let s = draw(&mut a, None, 80, 5);
+        assert_eq!(s.styled(2, drawn(ACTIVE_TAB)), " Files ");
+        assert!(s.text(2).contains("1/2 files (scanning...)"));
 
         press(&mut a, KeyCode::Tab);
         a.finish_walk();
-        let f = layout(&mut a, None, 80, 5);
-        assert_eq!(styled(&f.lines[2], Style::ActiveTab), " Content ");
-        assert!(text(&f.lines[2]).contains("type to search inside 1 files matching 'rs'"));
+        let s = draw(&mut a, None, 80, 5);
+        assert_eq!(s.styled(2, drawn(ACTIVE_TAB)), " Content ");
+        assert!(s.text(2).contains("type to search inside 1 files matching 'rs'"));
         press(&mut a, KeyCode::Char('x'));
-        let f = layout(&mut a, None, 80, 5);
-        assert!(text(&f.lines[2]).contains("0 matching lines in 1 files matching 'rs'"));
+        let s = draw(&mut a, None, 80, 5);
+        assert!(s.text(2).contains("0 matching lines in 1 files matching 'rs'"));
     }
 
     #[test]
     fn content_mode_with_blank_query_shows_hint() {
         let mut a = App::new(Mode::Content, "");
         a.finish_walk();
-        let f = layout(&mut a, None, 80, 5);
-        assert!(text(&f.lines[2]).contains("type to search inside 0 files"));
+        let s = draw(&mut a, None, 80, 5);
+        assert!(s.text(2).contains("type to search inside 0 files"));
     }
 
     fn content_app(m: ContentMatch) -> App {
@@ -696,10 +671,9 @@ mod tests {
             text: "let needle = 1;".into(),
             range: (4, 10),
         });
-        let f = layout(&mut a, None, 60, 5);
-        let row = &f.lines[0];
-        assert_eq!(text(row).trim_end(), "> src/main.rs:42: let needle = 1;");
-        assert_eq!(styled(row, Style::SelectedMatch), "needle");
+        let s = draw(&mut a, None, 60, 5);
+        assert_eq!(s.trimmed(0), "> src/main.rs:42: let needle = 1;");
+        assert_eq!(s.styled(0, drawn(SELECTED_MATCH)), "needle");
     }
 
     #[test]
@@ -712,10 +686,8 @@ mod tests {
             text: line,
             range: (200, 206),
         });
-        let f = layout(&mut a, None, 40, 5);
-        let row = &f.lines[0];
-        assert_eq!(styled(row, Style::SelectedMatch), "needle");
-        assert!(text(row).chars().count() <= 39);
+        let s = draw(&mut a, None, 40, 5);
+        assert_eq!(s.styled(0, drawn(SELECTED_MATCH)), "needle");
     }
 
     fn text_preview(path: &str, focus: Option<usize>, first_line: usize, lines: &[&str]) -> Preview {
@@ -728,30 +700,25 @@ mod tests {
         }
     }
 
-    /// The part of a row right of the separator.
-    fn pane(line: &Line) -> String {
-        text(line).split_once(SEPARATOR).map(|(_, p)| p.to_string()).unwrap_or_default()
-    }
-
     #[test]
     fn wide_terminal_shows_preview_pane() {
         let mut a = app(&["src/a.rs", "b.rs"], "");
         let p = text_preview("src/a.rs", None, 1, &["fn main() {", "}"]);
-        let f = layout(&mut a, Some(&p), 81, 8);
-        // Usable width 80: 40 list columns, separator, 39 preview columns.
-        let row: Vec<char> = text(&f.lines[0]).chars().collect();
+        let s = draw(&mut a, Some(&p), 80, 8);
+        // 40 list columns, the separator, a space, then the file.
+        let row: Vec<char> = s.text(0).chars().collect();
         assert_eq!(row[40], SEPARATOR);
-        assert!(text(&f.lines[0]).starts_with("> src/a.rs"));
-        assert_eq!(pane(&f.lines[0]), " src/a.rs");
-        assert_eq!(pane(&f.lines[1]), " 1 fn main() {");
-        assert_eq!(pane(&f.lines[2]), " 2 }");
-        assert_eq!(pane(&f.lines[3]).trim(), "");
+        assert!(s.text(0).starts_with("> src/a.rs"));
+        assert_eq!(s.pane(0), " src/a.rs");
+        assert_eq!(s.pane(1), " 1 fn main() {");
+        assert_eq!(s.pane(2), " 2 }");
+        assert_eq!(s.pane(3), "");
         // Every list row has the separator, even past the last result.
-        for line in &f.lines[0..5] {
-            assert!(text(line).contains(SEPARATOR));
+        for y in 0..5 {
+            assert!(s.text(y).contains(SEPARATOR));
         }
-        for line in &f.lines[5..8] {
-            assert!(!text(line).contains(SEPARATOR), "bottom rows are full width");
+        for y in 5..8 {
+            assert!(!s.text(y).contains(SEPARATOR), "bottom rows are full width");
         }
     }
 
@@ -759,22 +726,22 @@ mod tests {
     fn narrow_terminal_or_ctrl_t_hides_preview() {
         let mut a = app(&["a.rs"], "");
         let p = text_preview("a.rs", None, 1, &["x"]);
-        let f = layout(&mut a, Some(&p), 50, 6);
-        assert!(f.lines.iter().all(|l| !text(l).contains(SEPARATOR)));
+        let s = draw(&mut a, Some(&p), 50, 6);
+        assert!((0..6).all(|y| !s.text(y).contains(SEPARATOR)));
         assert_eq!(preview_rows(&a, 50, 6), None);
 
-        assert_eq!(preview_rows(&a, 81, 10), Some(6));
+        assert_eq!(preview_rows(&a, 80, 10), Some(6));
         a.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
-        let f = layout(&mut a, Some(&p), 81, 6);
-        assert!(f.lines.iter().all(|l| !text(l).contains(SEPARATOR)));
-        assert_eq!(preview_rows(&a, 81, 10), None);
+        let s = draw(&mut a, Some(&p), 80, 6);
+        assert!((0..6).all(|y| !s.text(y).contains(SEPARATOR)));
+        assert_eq!(preview_rows(&a, 80, 10), None);
     }
 
     #[test]
     fn preview_rows_needs_room_for_a_line() {
         let a = app(&["a.rs"], "");
-        assert_eq!(preview_rows(&a, 81, 5), Some(1));
-        assert_eq!(preview_rows(&a, 81, 4), None);
+        assert_eq!(preview_rows(&a, 80, 5), Some(1));
+        assert_eq!(preview_rows(&a, 80, 4), None);
     }
 
     #[test]
@@ -787,48 +754,43 @@ mod tests {
             range: (0, 1),
         });
         let p = text_preview("f.rs", Some(3), 2, &["ax", "x and x", "none"]);
-        let f = layout(&mut a, Some(&p), 81, 8);
-        assert_eq!(pane(&f.lines[0]), " f.rs:3  [2-4]");
-        assert_eq!(pane(&f.lines[1]), " 2 ax");
-        assert_eq!(styled(&f.lines[1], Style::Match), "x");
+        let s = draw(&mut a, Some(&p), 80, 8);
+        assert_eq!(s.pane(0), " f.rs:3  [2-4]");
+        assert_eq!(s.pane(1), " 2 ax");
+        assert_eq!(s.styled(1, drawn(MATCH)), "x");
         // Focused line: highlighted background, both occurrences marked.
-        assert!(pane(&f.lines[2]).starts_with(" 3 x and x"));
-        assert_eq!(styled(&f.lines[2], Style::SelectedMatch), "xx");
-        assert_eq!(pane(&f.lines[2]).chars().count(), 39, "focus line padded to pane width");
-        assert_eq!(styled(&f.lines[3], Style::Match), "");
+        assert!(s.pane(2).starts_with(" 3 x and x"));
+        assert_eq!(s.styled(2, drawn(SELECTED_MATCH)), "xx");
+        assert_eq!(s.rows[2].last().unwrap().1, drawn(SELECTED), "focus line padded to pane width");
+        assert_eq!(s.styled(3, drawn(MATCH)), "");
     }
 
     #[test]
     fn preview_notes_for_special_files() {
         let mut a = app(&["a"], "");
         let mut p = text_preview("a", None, 1, &[]);
-        assert_eq!(pane(&layout(&mut a, Some(&p), 81, 6).lines[1]), " (empty file)");
+        assert_eq!(draw(&mut a, Some(&p), 80, 6).pane(1), " (empty file)");
         p.body = Body::Binary;
-        assert_eq!(pane(&layout(&mut a, Some(&p), 81, 6).lines[1]), " (binary file)");
+        assert_eq!(draw(&mut a, Some(&p), 80, 6).pane(1), " (binary file)");
         p.body = Body::Unreadable("denied".into());
-        assert_eq!(pane(&layout(&mut a, Some(&p), 81, 6).lines[1]), " (cannot read: denied)");
+        assert_eq!(draw(&mut a, Some(&p), 80, 6).pane(1), " (cannot read: denied)");
     }
 
     #[test]
     fn gutter_aligns_line_numbers() {
         let mut a = app(&["a"], "");
         let p = text_preview("a", None, 9, &["nine", "ten"]);
-        let f = layout(&mut a, Some(&p), 81, 7);
-        assert_eq!(pane(&f.lines[1]), "  9 nine");
-        assert_eq!(pane(&f.lines[2]), " 10 ten");
+        let s = draw(&mut a, Some(&p), 80, 7);
+        assert_eq!(s.pane(1), "  9 nine");
+        assert_eq!(s.pane(2), " 10 ten");
     }
 
     #[test]
-    fn preview_lines_never_exceed_width() {
-        let long = "y".repeat(300);
+    fn long_preview_paths_keep_their_end() {
         let mut a = app(&["a"], "");
-        let p = text_preview(&"d/".repeat(100), Some(2), 1, &[&long, &long]);
-        for w in [61u16, 81, 120] {
-            let f = layout(&mut a, Some(&p), w, 6);
-            for line in &f.lines {
-                assert!(text(line).chars().count() < w as usize, "w={w}");
-            }
-        }
+        let p = text_preview(&("d/".repeat(100) + "end.rs"), None, 1, &["x"]);
+        let s = draw(&mut a, Some(&p), 80, 6);
+        assert!(s.pane(0).starts_with(" …") && s.pane(0).ends_with("end.rs"), "{}", s.pane(0));
     }
 
     #[test]
@@ -836,18 +798,18 @@ mod tests {
         let mut a = app(&["src/main.rs", "src/ui.rs", "README.md"], "");
         a.set_tree_view(true);
         press(&mut a, KeyCode::Down);
-        let f = layout(&mut a, None, 40, 8);
-        let rows: Vec<String> = f.lines[..4].iter().map(|l| text(l).trim_end().to_string()).collect();
+        let s = draw(&mut a, None, 40, 8);
+        let rows: Vec<String> = (0..4).map(|y| s.trimmed(y)).collect();
         assert_eq!(rows, vec!["  src/", "  \u{251c}\u{2500} main.rs", "> \u{2514}\u{2500} ui.rs", "  README.md"]);
-        assert_eq!(styled(&f.lines[0], Style::Dir), "src/");
+        assert_eq!(s.styled(0, drawn(DIR)), "src/");
     }
 
     #[test]
     fn tree_view_highlights_file_name_matches() {
         let mut a = app(&["src/main.rs"], "main");
         a.set_tree_view(true);
-        let f = layout(&mut a, None, 40, 6);
-        assert_eq!(styled(&f.lines[1], Style::SelectedMatch), "main");
+        let s = draw(&mut a, None, 40, 6);
+        assert_eq!(s.styled(1, drawn(SELECTED_MATCH)), "main");
     }
 
     #[test]
@@ -860,40 +822,40 @@ mod tests {
             range: (4, 5),
         });
         a.set_tree_view(true);
-        let f = layout(&mut a, None, 40, 7);
-        let rows: Vec<String> = f.lines[..3].iter().map(|l| text(l).trim_end().to_string()).collect();
+        let s = draw(&mut a, None, 40, 7);
+        let rows: Vec<String> = (0..3).map(|y| s.trimmed(y)).collect();
         assert_eq!(rows, vec!["  src/", "  \u{2514}\u{2500} a.rs", ">    \u{2514}\u{2500} 7: let x = 1;"]);
-        assert_eq!(styled(&f.lines[2], Style::SelectedMatch), "x");
+        assert_eq!(s.styled(2, drawn(SELECTED_MATCH)), "x");
     }
 
     #[test]
     fn regex_badge_and_error_in_status() {
         let mut a = app(&["a"], "a(");
-        let f = layout(&mut a, None, 80, 5);
-        assert_eq!(styled(&f.lines[2], Style::Badge), "");
+        let s = draw(&mut a, None, 80, 5);
+        assert_eq!(s.styled(2, drawn(BADGE)), "");
         a.set_regex(true);
-        let f = layout(&mut a, None, 80, 5);
-        assert_eq!(styled(&f.lines[2], Style::Badge), " regex ");
-        assert!(styled(&f.lines[2], Style::Error).contains("invalid regex: unclosed group"));
+        let s = draw(&mut a, None, 80, 5);
+        assert_eq!(s.styled(2, drawn(BADGE)), " regex ");
+        assert!(s.styled(2, drawn(ERROR)).contains("invalid regex: unclosed group"));
     }
 
     #[test]
     fn marked_rows_and_count() {
         let mut a = app(&["a", "b", "c"], "");
         a.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
-        let f = layout(&mut a, None, 40, 7);
-        assert_eq!(text(&f.lines[0]).trim_end(), " \u{2022}a");
-        assert_eq!(text(&f.lines[1]).trim_end(), "> b");
-        assert!(text(&f.lines[4]).contains("1 marked"));
+        let s = draw(&mut a, None, 40, 7);
+        assert_eq!(s.trimmed(0), " \u{2022}a");
+        assert_eq!(s.trimmed(1), "> b");
+        assert!(s.text(4).contains("1 marked"));
     }
 
     #[test]
     fn flash_message_in_status() {
         let mut a = app(&["a"], "");
         a.set_flash("copied: a");
-        let f = layout(&mut a, None, 60, 5);
-        assert!(text(&f.lines[2]).contains("copied: a"));
-        assert!(!text(&f.lines[2]).contains("1/1 files"));
+        let s = draw(&mut a, None, 60, 5);
+        assert!(s.text(2).contains("copied: a"));
+        assert!(!s.text(2).contains("1/1 files"));
     }
 
     #[test]
@@ -904,12 +866,13 @@ mod tests {
         assert_eq!(char_width('한'), 2);
         assert_eq!(char_width('\u{1F600}'), 2);
         assert_eq!(char_width('\u{0301}'), 0, "combining accent");
+        assert_eq!(char_width('\t'), 0, "ratatui does not draw control characters");
         assert_eq!(str_width("e\u{0301}漢"), 3);
     }
 
     #[test]
     fn fit_respects_wide_chars() {
-        let cells = text_cells("漢字漢字", Style::Normal);
+        let cells = text_cells("漢字漢字", NORMAL);
         let s = |c: Vec<Cell>| c.into_iter().map(|c| c.0).collect::<String>();
         assert_eq!(s(fit_right(cells.clone(), 5)), "漢字\u{2026}");
         assert_eq!(s(fit_left(cells.clone(), 5)), "\u{2026}漢字");
@@ -918,36 +881,32 @@ mod tests {
     }
 
     #[test]
-    fn wide_paths_never_exceed_width() {
+    fn wide_paths_keep_the_separator_in_place() {
         let mut a = app(&["文档/非常长的文件名称测试用例.txt", "😀/x.txt"], "");
         let p = text_preview("文档/x", None, 1, &["漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字漢字"]);
-        for w in [20u16, 61, 81] {
-            let f = layout(&mut a, Some(&p), w, 6);
-            for line in &f.lines {
-                assert!(str_width(&text(line)) < w as usize, "w={w}: {:?}", text(line));
-            }
-        }
-        // The separator stays in the same column on every row.
-        let f = layout(&mut a, Some(&p), 81, 6);
-        let col = |l: &Line| str_width(text(l).split(SEPARATOR).next().unwrap());
-        assert_eq!(col(&f.lines[0]), col(&f.lines[1]));
+        let s = draw(&mut a, Some(&p), 80, 6);
+        assert!(s.text(0).split(SEPARATOR).next().unwrap().trim_end().ends_with("例.txt"));
+        let col = |y: usize| str_width(s.text(y).split(SEPARATOR).next().unwrap());
+        assert_eq!(col(0), 40);
+        assert_eq!(col(1), 40);
+        assert_eq!(col(2), 40);
     }
 
     #[test]
     fn prompt_cursor_counts_wide_chars() {
         let mut a = app(&[], "漢a");
-        let f = layout(&mut a, None, 40, 4);
-        assert_eq!(f.cursor.0, 2 + 3);
+        let s = draw(&mut a, None, 40, 4);
+        assert_eq!(s.cursor.0, 2 + 3);
     }
 
     #[test]
     fn hit_test_regions() {
         let a = app(&["a"], "");
-        // 81 wide: list 0..40, separator at 40, preview after; 6 high: 3 list rows.
-        assert_eq!(hit_test(&a, 81, 6, 5, 1), Hit::List(1));
-        assert_eq!(hit_test(&a, 81, 6, 40, 1), Hit::Other);
-        assert_eq!(hit_test(&a, 81, 6, 60, 0), Hit::Preview);
-        assert_eq!(hit_test(&a, 81, 6, 5, 4), Hit::Other, "prompt row");
+        // 80 wide: list 0..40, separator at 40, preview after; 6 high: 3 list rows.
+        assert_eq!(hit_test(&a, 80, 6, 5, 1), Hit::List(1));
+        assert_eq!(hit_test(&a, 80, 6, 40, 1), Hit::Other);
+        assert_eq!(hit_test(&a, 80, 6, 60, 0), Hit::Preview);
+        assert_eq!(hit_test(&a, 80, 6, 5, 4), Hit::Other, "prompt row");
         assert_eq!(hit_test(&a, 40, 6, 30, 2), Hit::List(2), "no preview when narrow");
     }
 
@@ -955,13 +914,12 @@ mod tests {
     fn scrolled_preview_shows_line_range() {
         let mut a = app(&["a"], "");
         let p = text_preview("a", None, 4, &["four", "five"]);
-        let f = layout(&mut a, Some(&p), 81, 6);
-        assert_eq!(pane(&f.lines[0]), " a  [4-5]");
+        assert_eq!(draw(&mut a, Some(&p), 80, 6).pane(0), " a  [4-5]");
     }
 
     #[test]
     fn fit_helpers() {
-        let cells = text_cells("abcdef", Style::Normal);
+        let cells = text_cells("abcdef", NORMAL);
         let s = |c: Vec<Cell>| c.into_iter().map(|c| c.0).collect::<String>();
         assert_eq!(s(fit_right(cells.clone(), 4)), "abc…");
         assert_eq!(s(fit_left(cells.clone(), 4)), "…def");
@@ -971,18 +929,14 @@ mod tests {
 
     #[test]
     fn spans_merge_same_style() {
-        let cells = vec![('a', Style::Normal), ('b', Style::Normal), ('c', Style::Match)];
-        assert_eq!(to_spans(&cells), vec![span("ab", Style::Normal), span("c", Style::Match)]);
+        let cells = vec![('a', NORMAL), ('b', NORMAL), ('c', MATCH)];
+        assert_eq!(to_spans(&cells), Line::from(vec![Span::styled("ab", NORMAL), Span::styled("c", MATCH)]));
     }
 
     #[test]
-    fn draw_writes_text_and_escape_codes() {
-        let mut a = app(&["hello.txt"], "");
-        let f = layout(&mut a, None, 30, 4);
-        let mut buf = Vec::new();
-        draw(&mut buf, &f).unwrap();
-        let out = String::from_utf8_lossy(&buf);
-        assert!(out.contains("hello.txt"));
-        assert!(out.contains("\x1b["));
+    fn cursor_sits_in_the_prompt() {
+        let mut a = app(&["hello.txt"], "he");
+        let s = draw(&mut a, None, 30, 4);
+        assert_eq!(s.cursor, (4, 2));
     }
 }
