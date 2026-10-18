@@ -2,14 +2,16 @@
 //! the terminal to `App`. The UI is drawn on stderr so stdout stays clean for
 //! the selected result (e.g. `code $(ff)`).
 
-use std::io::{self, BufWriter};
+use std::io::{self, BufWriter, Stderr};
 use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
 
-use crossterm::cursor::Show;
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
-use crossterm::execute;
-use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
+use ratatui::backend::CrosstermBackend;
+use ratatui::crossterm::cursor::Show;
+use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
+use ratatui::crossterm::execute;
+use ratatui::crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
+use ratatui::Terminal;
 
 use crate::app::{App, Mode, Outcome, MAX_CONTENT_RESULTS};
 use crate::clipboard;
@@ -95,7 +97,8 @@ pub fn run(cfg: &Config) -> io::Result<Outcome> {
     app.set_boosts(history.boosts_under(&cfg.root, history::now()));
 
     let _guard = TerminalGuard::enter(!cfg.no_mouse)?;
-    let mut out = BufWriter::new(io::stderr());
+    let mut terminal: Terminal<CrosstermBackend<BufWriter<Stderr>>> =
+        Terminal::new(CrosstermBackend::new(BufWriter::new(io::stderr())))?;
     let mut dirty = true;
     let mut preview: Option<Preview> = None;
 
@@ -140,8 +143,7 @@ pub fn run(cfg: &Config) -> io::Result<Outcome> {
             app.adjust_scroll(ui::list_height(h));
             let rows = ui::preview_rows(&app, w, h);
             refresh_preview(&mut preview, &mut app, rows);
-            let frame = ui::layout(&mut app, preview.as_ref(), w, h);
-            ui::draw(&mut out, &frame)?;
+            terminal.draw(|frame| ui::render(&mut app, preview.as_ref(), frame))?;
             dirty = false;
         }
 
